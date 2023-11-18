@@ -1,0 +1,6 @@
+train: 'C:/Users/ekine/OneDrive/Desktop/CSCI/masters/ComputerVision/project/test_data/detection/images'
+val: 'C:/Users/ekine/OneDrive/Desktop/CSCI/masters/ComputerVision/project/test_data/detection/val/images'
+ 
+# class names
+names:
+  0: 'apple'
