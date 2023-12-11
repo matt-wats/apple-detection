@@ -1,282 +1,214 @@
-import datetime
-import errno
-import os
-import time
-from collections import defaultdict, deque
+import numpy as np
 
-import torch
-import torch.distributed as dist
-
-
-class SmoothedValue:
-    """Track a series of values and provide access to smoothed values over a
-    window or the global series average.
-    """
-
-    def __init__(self, window_size=20, fmt=None):
-        if fmt is None:
-            fmt = "{median:.4f} ({global_avg:.4f})"
-        self.deque = deque(maxlen=window_size)
-        self.total = 0.0
-        self.count = 0
-        self.fmt = fmt
-
-    def update(self, value, n=1):
-        self.deque.append(value)
-        self.count += n
-        self.total += value * n
-
-    def synchronize_between_processes(self):
-        """
-        Warning: does not synchronize the deque!
-        """
-        if not is_dist_avail_and_initialized():
-            return
-        t = torch.tensor([self.count, self.total], dtype=torch.float64, device="cuda")
-        dist.barrier()
-        dist.all_reduce(t)
-        t = t.tolist()
-        self.count = int(t[0])
-        self.total = t[1]
-
-    @property
-    def median(self):
-        d = torch.tensor(list(self.deque))
-        return d.median().item()
-
-    @property
-    def avg(self):
-        d = torch.tensor(list(self.deque), dtype=torch.float32)
-        return d.mean().item()
-
-    @property
-    def global_avg(self):
-        return self.total / self.count
-
-    @property
-    def max(self):
-        return max(self.deque)
-
-    @property
-    def value(self):
-        return self.deque[-1]
-
-    def __str__(self):
-        return self.fmt.format(
-            median=self.median, avg=self.avg, global_avg=self.global_avg, max=self.max, value=self.value
+# https://github.com/colmap/colmap/blob/main/scripts/python/read_write_dense.py
+def read_array(path):
+    with open(path, "rb") as fid:
+        width, height, channels = np.genfromtxt(
+            fid, delimiter="&", max_rows=1, usecols=(0, 1, 2), dtype=int
         )
+        fid.seek(0)
+        num_delimiter = 0
+        byte = fid.read(1)
+        while True:
+            if byte == b"&":
+                num_delimiter += 1
+                if num_delimiter >= 3:
+                    break
+            byte = fid.read(1)
+        array = np.fromfile(fid, np.float32)
+    array = array.reshape((width, height, channels), order="F")
+    return np.transpose(array, (1, 0, 2)).squeeze()
 
 
-def all_gather(data):
+def equation_plane(pts):
+    x1,y1,z1 = pts[0]
+    x2,y2,z2 = pts[1]
+    x3,y3,z3 = pts[2]
+    a1 = x2 - x1
+    b1 = y2 - y1
+    c1 = z2 - z1
+    a2 = x3 - x1
+    b2 = y3 - y1
+    c2 = z3 - z1
+    a = b1 * c2 - b2 * c1
+    b = a2 * c1 - a1 * c2
+    c = a1 * b2 - b1 * a2
+    d = (- a * x1 - b * y1 - c * z1)
+
+    return np.array([a,b,c,d]) / d
+
+def calculate_distances(pts, plane): 
+     
+    d = abs(pts @ plane[:3] + plane[3]) 
+    e = np.linalg.norm(plane[:3])
+    
+    return d/e
+
+def find_ground_plane(pts, max_iters=1000, t=1e-1):
+    best_num = -1
+    best_plane = None
+    best_inliers = None
+    for i in range(max_iters):
+        indices = np.random.choice(pts.shape[0], size=3, replace=True)
+        chosen_pts = pts[indices]
+        plane = equation_plane(chosen_pts)
+
+        distances = calculate_distances(pts, plane)
+        inliers = np.nonzero(distances < t)[0]
+        num_inliers = len(inliers)
+
+        if num_inliers > best_num:
+            best_num = num_inliers
+            best_plane = plane
+            best_inliers = inliers
+
+    return best_plane, best_inliers, best_num
+
+
+# https://automaticaddison.com/how-to-convert-a-quaternion-to-a-rotation-matrix/
+def quaternion_rotation_matrix(Q):
     """
-    Run all_gather on arbitrary picklable data (not necessarily tensors)
-    Args:
-        data: any picklable object
-    Returns:
-        list[data]: list of data gathered from each rank
+    Covert a quaternion into a full three-dimensional rotation matrix.
+ 
+    Input
+    :param Q: A 4 element array representing the quaternion (q0,q1,q2,q3) 
+ 
+    Output
+    :return: A 3x3 element matrix representing the full 3D rotation matrix. 
+             This rotation matrix converts a point in the local reference 
+             frame to a point in the global reference frame.
     """
-    world_size = get_world_size()
-    if world_size == 1:
-        return [data]
-    data_list = [None] * world_size
-    dist.all_gather_object(data_list, data)
-    return data_list
+    # Extract the values from Q
+    q0 = Q[0]
+    q1 = Q[1]
+    q2 = Q[2]
+    q3 = Q[3]
+     
+    # First row of the rotation matrix
+    r00 = 2 * (q0 * q0 + q1 * q1) - 1
+    r01 = 2 * (q1 * q2 - q0 * q3)
+    r02 = 2 * (q1 * q3 + q0 * q2)
+     
+    # Second row of the rotation matrix
+    r10 = 2 * (q1 * q2 + q0 * q3)
+    r11 = 2 * (q0 * q0 + q2 * q2) - 1
+    r12 = 2 * (q2 * q3 - q0 * q1)
+     
+    # Third row of the rotation matrix
+    r20 = 2 * (q1 * q3 - q0 * q2)
+    r21 = 2 * (q2 * q3 + q0 * q1)
+    r22 = 2 * (q0 * q0 + q3 * q3) - 1
+     
+    # 3x3 rotation matrix
+    rot_matrix = np.array([[r00, r01, r02],
+                           [r10, r11, r12],
+                           [r20, r21, r22]])
+                            
+    return rot_matrix
 
 
-def reduce_dict(input_dict, average=True):
-    """
-    Args:
-        input_dict (dict): all the values will be reduced
-        average (bool): whether to do average or sum
-    Reduce the values in the dictionary from all processes so that all processes
-    have the averaged results. Returns a dict with the same fields as
-    input_dict, after reduction.
-    """
-    world_size = get_world_size()
-    if world_size < 2:
-        return input_dict
-    with torch.inference_mode():
-        names = []
-        values = []
-        # sort the keys so that they are consistent across processes
-        for k in sorted(input_dict.keys()):
-            names.append(k)
-            values.append(input_dict[k])
-        values = torch.stack(values, dim=0)
-        dist.all_reduce(values)
-        if average:
-            values /= world_size
-        reduced_dict = {k: v for k, v in zip(names, values)}
-    return reduced_dict
 
 
-class MetricLogger:
-    def __init__(self, delimiter="\t"):
-        self.meters = defaultdict(SmoothedValue)
-        self.delimiter = delimiter
-
-    def update(self, **kwargs):
-        for k, v in kwargs.items():
-            if isinstance(v, torch.Tensor):
-                v = v.item()
-            assert isinstance(v, (float, int))
-            self.meters[k].update(v)
-
-    def __getattr__(self, attr):
-        if attr in self.meters:
-            return self.meters[attr]
-        if attr in self.__dict__:
-            return self.__dict__[attr]
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{attr}'")
-
-    def __str__(self):
-        loss_str = []
-        for name, meter in self.meters.items():
-            loss_str.append(f"{name}: {str(meter)}")
-        return self.delimiter.join(loss_str)
-
-    def synchronize_between_processes(self):
-        for meter in self.meters.values():
-            meter.synchronize_between_processes()
-
-    def add_meter(self, name, meter):
-        self.meters[name] = meter
-
-    def log_every(self, iterable, print_freq, header=None):
-        i = 0
-        if not header:
-            header = ""
-        start_time = time.time()
-        end = time.time()
-        iter_time = SmoothedValue(fmt="{avg:.4f}")
-        data_time = SmoothedValue(fmt="{avg:.4f}")
-        space_fmt = ":" + str(len(str(len(iterable)))) + "d"
-        if torch.cuda.is_available():
-            log_msg = self.delimiter.join(
-                [
-                    header,
-                    "[{0" + space_fmt + "}/{1}]",
-                    "eta: {eta}",
-                    "{meters}",
-                    "time: {time}",
-                    "data: {data}",
-                    "max mem: {memory:.0f}",
-                ]
-            )
-        else:
-            log_msg = self.delimiter.join(
-                [header, "[{0" + space_fmt + "}/{1}]", "eta: {eta}", "{meters}", "time: {time}", "data: {data}"]
-            )
-        MB = 1024.0 * 1024.0
-        for obj in iterable:
-            data_time.update(time.time() - end)
-            yield obj
-            iter_time.update(time.time() - end)
-            if i % print_freq == 0 or i == len(iterable) - 1:
-                eta_seconds = iter_time.global_avg * (len(iterable) - i)
-                eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-                if torch.cuda.is_available():
-                    print(
-                        log_msg.format(
-                            i,
-                            len(iterable),
-                            eta=eta_string,
-                            meters=str(self),
-                            time=str(iter_time),
-                            data=str(data_time),
-                            memory=torch.cuda.max_memory_allocated() / MB,
-                        )
-                    )
-                else:
-                    print(
-                        log_msg.format(
-                            i, len(iterable), eta=eta_string, meters=str(self), time=str(iter_time), data=str(data_time)
-                        )
-                    )
-            i += 1
-            end = time.time()
-        total_time = time.time() - start_time
-        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print(f"{header} Total time: {total_time_str} ({total_time / len(iterable):.4f} s / it)")
 
 
-def collate_fn(batch):
-    return tuple(zip(*batch))
+
+import os
+from PIL import Image
 
 
-def mkdir(path):
-    try:
-        os.makedirs(path)
-    except OSError as e:
-        if e.errno != errno.EEXIST:
-            raise
+
+# 3d functions
+# getting matrices
+def get_extrinsic_matrix(pose):
+    R = quaternion_rotation_matrix(pose[:4])
+    T = pose[-3:]
+
+    extrinsic = np.zeros((4,4))
+    extrinsic[:3,:3] = R
+    extrinsic[:3, -1] = T
+    extrinsic[3,3] = 1
+
+    return extrinsic
+
+def get_K_matrix(cam_params):
+    K = np.zeros((3,4))
+    K[(0,1),(0,1)] = cam_params[0]
+    K[:2, 2] = cam_params[1:3]
+    K[2,2] = 1
+
+    return K
+
+def get_K_inv(K):
+    kinv = np.zeros((4,3))
+    f = K[0,0]
+    kinv[(0,1),(0,1)] = 1/f
+    kinv[2,2] = 1
+    kinv[:2, 2] = -K[:2,2] / f
+    return kinv
+    
+
+# getting view
+def get_camera_view(points3d, extrinsic):
+    camera_points = np.pad(points3d, pad_width=((0,0), (0,1)), mode="constant", constant_values=1) @ extrinsic.T
+    return camera_points
+
+def get_image_view(camera_points, intrinsic):
+    pixel_points = camera_points @ intrinsic.T
+    pixel_points = pixel_points / pixel_points[:,2:3]
+    return pixel_points
+
+def get_in_view_points(pixel_points):
+    i_under = pixel_points[:,0] < 720
+    i_over = pixel_points[:,0] > 0
+    j_under = pixel_points[:,1] < 1280
+    j_over = pixel_points[:,1] > 0
+    pixel_inliers = i_under*i_over*j_under*j_over
+    return pixel_inliers
+
+# get indices of 3d points
+def select_apple_points(camera_points, pixel_points, inliers, mask):
+    apple_points_dict = dict()
+    for idx, pt in zip(np.where(inliers)[0], np.floor(pixel_points[inliers,:2])):
+        new_val = camera_points[idx,2]
+        r,c = np.int32(pt)
+        key = f"{r}-{c}"
+        if apple_points_dict.get(key, np.inf) > new_val:
+            r,c = np.int32(pt)
+            if mask[c,r] == 1:
+                apple_points_dict[key] = idx
+    apple_points_indices = list(apple_points_dict.values())
+
+    return apple_points_indices
 
 
-def setup_for_distributed(is_master):
-    """
-    This function disables printing when not in master process
-    """
-    import builtins as __builtin__
+# get 3d points
+def get_3d_apple_points(points3d, extrinsic, intrinsic, mask):
+    cam_pts = get_camera_view(points3d, extrinsic)
+    pixel_pts = get_image_view(cam_pts, intrinsic)
+    inliers = get_in_view_points(pixel_pts)
 
-    builtin_print = __builtin__.print
+    apple_points_indices = select_apple_points(cam_pts, pixel_pts, inliers, mask)
 
-    def print(*args, **kwargs):
-        force = kwargs.pop("force", False)
-        if is_master or force:
-            builtin_print(*args, **kwargs)
-
-    __builtin__.print = print
+    return apple_points_indices, pixel_pts
 
 
-def is_dist_avail_and_initialized():
-    if not dist.is_available():
-        return False
-    if not dist.is_initialized():
-        return False
-    return True
 
 
-def get_world_size():
-    if not is_dist_avail_and_initialized():
-        return 1
-    return dist.get_world_size()
+# map
+class Maps():
+    def __init__(self, filenames, mask_root, image_root) -> None:
+        self.filenames = filenames
+        self.mask_root = mask_root
+        self.image_root = image_root
 
+    def __len__(self):
+        return len(self.filenames)
+    
+    def __getitem__(self, idx):
+        mask = np.array(Image.open(os.path.join(self.mask_root, self.filenames[idx])))
+        bool_mask = mask > 0
+        mask = np.int8(bool_mask)
 
-def get_rank():
-    if not is_dist_avail_and_initialized():
-        return 0
-    return dist.get_rank()
+        image = np.array(Image.open(os.path.join(self.image_root, self.filenames[idx])))
 
-
-def is_main_process():
-    return get_rank() == 0
-
-
-def save_on_master(*args, **kwargs):
-    if is_main_process():
-        torch.save(*args, **kwargs)
-
-
-def init_distributed_mode(args):
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ["WORLD_SIZE"])
-        args.gpu = int(os.environ["LOCAL_RANK"])
-    elif "SLURM_PROCID" in os.environ:
-        args.rank = int(os.environ["SLURM_PROCID"])
-        args.gpu = args.rank % torch.cuda.device_count()
-    else:
-        print("Not using distributed mode")
-        args.distributed = False
-        return
-
-    args.distributed = True
-
-    torch.cuda.set_device(args.gpu)
-    args.dist_backend = "nccl"
-    print(f"| distributed init (rank {args.rank}): {args.dist_url}", flush=True)
-    torch.distributed.init_process_group(
-        backend=args.dist_backend, init_method=args.dist_url, world_size=args.world_size, rank=args.rank
-    )
-    torch.distributed.barrier()
-    setup_for_distributed(args.rank == 0)
+        return mask, image
